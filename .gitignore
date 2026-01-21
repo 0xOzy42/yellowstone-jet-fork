@@ -1,0 +1,6 @@
+/target
+.vscode
+config-gentx-test.yml
+.local
+.env
+target
