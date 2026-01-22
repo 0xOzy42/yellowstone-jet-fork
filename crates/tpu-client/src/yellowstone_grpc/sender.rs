@@ -464,25 +464,61 @@ impl YellowstoneTpuSender {
     where
         T: AsRef<[u8]> + Send + 'static,
     {
+        tracing::debug!(
+            "[send_txn_many_dest] Starting: sig={}, destinations={}",
+            sig,
+            dests.len()
+        );
+
         if dests.is_empty() {
+            tracing::debug!("[send_txn_many_dest] No destinations, returning early");
             return Ok(());
         }
 
         let wire_txn = Bytes::from_owner(txn);
 
-        for dest in dests {
+        for (idx, dest) in dests.iter().enumerate() {
+            tracing::debug!(
+                "[send_txn_many_dest] Sending to destination {}/{}: {} (sig={})",
+                idx + 1,
+                dests.len(),
+                dest,
+                sig
+            );
+
             let tpu_txn = TpuSenderTxn {
                 tx_sig: sig,
                 remote_peer: *dest,
                 wire: wire_txn.clone(),
             };
+
             if self.base_tpu_sender.send_txn(tpu_txn).await.is_err() {
+                tracing::error!(
+                    "[send_txn_many_dest] TPU sender channel closed while sending to {} (destination {}/{})",
+                    dest,
+                    idx + 1,
+                    dests.len()
+                );
                 return Err(SendError {
                     kind: SendErrorKind::Closed,
                     txn: wire_txn,
                 });
             }
+
+            tracing::debug!(
+                "[send_txn_many_dest] Successfully queued for destination {}/{}: {}",
+                idx + 1,
+                dests.len(),
+                dest
+            );
         }
+
+        tracing::debug!(
+            "[send_txn_many_dest] Completed: sent to all {} destinations (sig={})",
+            dests.len(),
+            sig
+        );
+
         Ok(())
     }
 
@@ -513,14 +549,25 @@ impl YellowstoneTpuSender {
     where
         T: AsRef<[u8]> + Send + 'static,
     {
+        tracing::debug!(
+            "[send_txn_to_n_leaders] Starting: sig={}, num_leaders={}",
+            sig,
+            num_leaders
+        );
+
         if num_leaders == 0 {
+            tracing::debug!("[send_txn_to_n_leaders] num_leaders=0, returning early");
             return Ok(());
         }
 
         let wire_txn = Bytes::from_owner(txn);
         let current_slot = match self.atomic_slot_tracker.load() {
-            Ok(slot) => slot,
+            Ok(slot) => {
+                tracing::debug!("[send_txn_to_n_leaders] Current slot loaded: {}", slot);
+                slot
+            }
             Err(_) => {
+                tracing::error!("[send_txn_to_n_leaders] Slot tracker disconnected!");
                 return Err(SendError {
                     kind: SendErrorKind::SlotTrackerDisconnected,
                     txn: wire_txn,
@@ -532,35 +579,96 @@ impl YellowstoneTpuSender {
         let reminder = current_slot % 4;
         let floor_leader_boundary = current_slot.saturating_sub(reminder);
 
+        tracing::debug!(
+            "[send_txn_to_n_leaders] Slot calculations: current_slot={}, reminder={}/4, floor_leader_boundary={}",
+            current_slot,
+            reminder,
+            floor_leader_boundary
+        );
+
         // Collect the leaders for the next num_leaders consecutive leader slots
-        let leaders: Vec<Pubkey> = (0..num_leaders)
-            .map(|i| floor_leader_boundary + (i * 4) as u64)
-            .filter_map(|leader_slot_boundary| {
-                match self.leader_schedule.get_leader(leader_slot_boundary) {
-                    Ok(Some(leader)) => Some(Ok(leader)),
-                    Ok(None) => {
-                        tracing::warn!(
-                            "unknown leader for slot boundary {leader_slot_boundary}, skipping"
-                        );
-                        None
-                    }
-                    Err(_) => Some(Err(SendErrorKind::ManagedLeaderScheduleDisconnected)),
+        let mut leader_results = Vec::new();
+        for i in 0..num_leaders {
+            let leader_slot_boundary = floor_leader_boundary + (i * 4) as u64;
+            match self.leader_schedule.get_leader(leader_slot_boundary) {
+                Ok(Some(leader)) => {
+                    tracing::debug!(
+                        "[send_txn_to_n_leaders] Leader #{} found: slot_boundary={}, leader={}",
+                        i,
+                        leader_slot_boundary,
+                        leader
+                    );
+                    leader_results.push(Ok(leader));
                 }
-            })
+                Ok(None) => {
+                    tracing::warn!(
+                        "[send_txn_to_n_leaders] Leader #{} UNKNOWN for slot_boundary={}, skipping",
+                        i,
+                        leader_slot_boundary
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "[send_txn_to_n_leaders] Leader schedule disconnected at slot_boundary={}",
+                        leader_slot_boundary
+                    );
+                    leader_results.push(Err(SendErrorKind::ManagedLeaderScheduleDisconnected));
+                }
+            }
+        }
+
+        let leaders: Vec<Pubkey> = leader_results
+            .into_iter()
             .collect::<Result<Vec<_>, SendErrorKind>>()
             .map_err(|kind| SendError {
                 kind,
                 txn: wire_txn.clone(),
             })?;
 
+        tracing::debug!(
+            "[send_txn_to_n_leaders] Collected {}/{} leaders: {:?}",
+            leaders.len(),
+            num_leaders,
+            leaders
+        );
+
         if leaders.is_empty() {
+            tracing::error!(
+                "[send_txn_to_n_leaders] No leaders found! Requested {}, got 0",
+                num_leaders
+            );
             return Err(SendError {
                 kind: SendErrorKind::SlotTrackerDisconnected,
                 txn: wire_txn,
             });
         }
 
-        self.send_txn_many_dest(sig, wire_txn, &leaders).await
+        tracing::debug!(
+            "[send_txn_to_n_leaders] Sending transaction {} to {} leader(s)",
+            sig,
+            leaders.len()
+        );
+
+        let result = self.send_txn_many_dest(sig, wire_txn, &leaders).await;
+
+        match &result {
+            Ok(_) => {
+                tracing::debug!(
+                    "[send_txn_to_n_leaders] Successfully sent transaction {} to all {} leaders",
+                    sig,
+                    leaders.len()
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[send_txn_to_n_leaders] Failed to send transaction {}: {:?}",
+                    sig,
+                    e
+                );
+            }
+        }
+
+        result
     }
 
     ///
