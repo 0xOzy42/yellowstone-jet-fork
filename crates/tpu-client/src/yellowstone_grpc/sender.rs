@@ -281,9 +281,9 @@ pub enum CreateTpuSenderError {
 /// This struct is cheaply-cloneable and can be shared between threads.
 #[derive(Clone)]
 pub struct YellowstoneTpuSender {
-    base_tpu_sender: TpuSender,
-    atomic_slot_tracker: Arc<AtomicSlotTracker>,
-    leader_schedule: ManagedLeaderSchedule,
+    pub base_tpu_sender: TpuSender,
+    pub atomic_slot_tracker: Arc<AtomicSlotTracker>,
+    pub leader_schedule: ManagedLeaderSchedule,
 }
 
 ///
@@ -484,6 +484,83 @@ impl YellowstoneTpuSender {
             }
         }
         Ok(())
+    }
+
+    ///
+    /// Sends a transaction to the TPUs of N consecutive leaders starting from the current slot.
+    ///
+    /// # Arguments
+    ///
+    /// * `sig` - The [`Signature`] identifying the transaction.
+    /// * `txn` - The bincoded transaction slice to send.
+    /// * `num_leaders` - The number of consecutive leaders to send to (must be > 0).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the transaction was sent successfully to all leaders, or a `SendError` if there was an error.
+    ///
+    /// # Note
+    ///
+    /// Each leader is responsible for 4 consecutive slots. This function will send to
+    /// `num_leaders` consecutive leaders starting from the current slot's leader.
+    ///
+    pub async fn send_txn_to_n_leaders<T>(
+        &mut self,
+        sig: Signature,
+        txn: T,
+        num_leaders: usize,
+    ) -> Result<(), SendError>
+    where
+        T: AsRef<[u8]> + Send + 'static,
+    {
+        if num_leaders == 0 {
+            return Ok(());
+        }
+
+        let wire_txn = Bytes::from_owner(txn);
+        let current_slot = match self.atomic_slot_tracker.load() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err(SendError {
+                    kind: SendErrorKind::SlotTrackerDisconnected,
+                    txn: wire_txn,
+                });
+            }
+        };
+
+        // Calculate the slot boundary for the current leader
+        let reminder = current_slot % 4;
+        let floor_leader_boundary = current_slot.saturating_sub(reminder);
+
+        // Collect the leaders for the next num_leaders consecutive leader slots
+        let leaders: Vec<Pubkey> = (0..num_leaders)
+            .map(|i| floor_leader_boundary + (i * 4) as u64)
+            .filter_map(|leader_slot_boundary| {
+                match self.leader_schedule.get_leader(leader_slot_boundary) {
+                    Ok(Some(leader)) => Some(Ok(leader)),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "unknown leader for slot boundary {leader_slot_boundary}, skipping"
+                        );
+                        None
+                    }
+                    Err(_) => Some(Err(SendErrorKind::ManagedLeaderScheduleDisconnected)),
+                }
+            })
+            .collect::<Result<Vec<_>, SendErrorKind>>()
+            .map_err(|kind| SendError {
+                kind,
+                txn: wire_txn.clone(),
+            })?;
+
+        if leaders.is_empty() {
+            return Err(SendError {
+                kind: SendErrorKind::SlotTrackerDisconnected,
+                txn: wire_txn,
+            });
+        }
+
+        self.send_txn_many_dest(sig, wire_txn, &leaders).await
     }
 
     ///
