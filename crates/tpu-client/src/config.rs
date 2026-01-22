@@ -266,7 +266,9 @@ pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_secs(2); // 400ms *
 pub const DEFAULT_MAX_SEND_ATTEMPT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 pub const DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_TX_SEND_TIMEOUT: Duration = Duration::from_secs(2);
-pub const DEFAULT_LEADER_PREDICTION_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Predicts 5 leaders by default: n-1 (previous), n (current), n+1, n+2, n+3 (next 3)
+/// This maximizes transaction landing probability by maintaining warm QUIC connections
+pub const DEFAULT_LEADER_PREDICTION_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(5).unwrap();
 
 impl Default for TpuSenderConfig {
     fn default() -> Self {
